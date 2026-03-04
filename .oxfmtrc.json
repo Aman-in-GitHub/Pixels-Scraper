@@ -1,11 +1,18 @@
 {
   "$schema": "./node_modules/oxfmt/configuration_schema.json",
   "experimentalSortImports": {
-    "order": "asc",
-    "ignoreCase": true,
-    "newlinesBetween": true,
-    "partitionByComment": false,
-    "partitionByNewline": false,
-    "sortSideEffects": false
-  }
+    "groups": [
+      "type-import",
+      ["value-builtin", "value-external"],
+      "type-internal",
+      "value-internal",
+      ["type-parent", "type-sibling", "type-index"],
+      ["value-parent", "value-sibling", "value-index"],
+      "unknown"
+    ]
+  },
+  "experimentalSortPackageJson": {
+    "sortScripts": true
+  },
+  "ignorePatterns": ["**/node_modules", "**/storage"]
 }

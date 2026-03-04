@@ -1,27 +1,27 @@
 {
   "name": "pixels-scraper",
-  "version": "1.0.0",
+  "version": "0.0.0",
   "private": true,
   "type": "module",
   "main": "src/index.ts",
   "scripts": {
-    "start": "rm -rf ./dist && tsc && node dist/src/index.js",
+    "format": "oxfmt",
     "lint": "oxlint",
-    "format": "oxfmt"
+    "start": "rm -rf ./dist && tsc && node dist/src/index.js"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.95.3",
+    "@supabase/supabase-js": "^2.98.0",
     "crawlee": "^3.16.0",
     "dotenv": "^17.3.1",
     "playwright": "^1.58.2",
-    "tldts": "^7.0.23"
+    "tldts": "^7.0.24"
   },
   "devDependencies": {
-    "@types/node": "^24.10.13",
-    "lefthook": "^2.1.1",
-    "oxfmt": "^0.32.0",
-    "oxlint": "^1.47.0",
-    "supabase": "^2.76.8",
+    "@types/node": "^25.3.3",
+    "lefthook": "^2.1.2",
+    "oxfmt": "^0.36.0",
+    "oxlint": "^1.51.0",
+    "supabase": "^2.76.16",
     "typescript": "^5.9.3"
   },
   "packageManager": "pnpm@10.29.3"

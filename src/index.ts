@@ -1,5 +1,12 @@
 import "dotenv/config";
-import { Dataset, log, PlaywrightCrawler, RequestQueue } from "crawlee";
+import {
+  CheerioCrawler,
+  Dataset,
+  log,
+  PlaywrightCrawler,
+  RequestQueue,
+  type CheerioAPI,
+} from "crawlee";
 import fs from "fs";
 import { readFileSync } from "node:fs";
 import { appendFile } from "node:fs/promises";
@@ -12,7 +19,6 @@ import {
   isValidImageUrl,
   scrollToBottom,
   shouldSkipPage,
-  uploadScreenshotToStorage,
   validateAndNormalizeUrl,
 } from "./utils.js";
 
@@ -28,14 +34,11 @@ type RawItem = {
     height: number;
     alt: string;
   }>;
-  screenshot: string;
 };
 
-type RawItemWithBuffer = Omit<RawItem, "screenshot"> & {
-  screenshot_buffer: Buffer;
-};
+let itemBatch: RawItem[] = [];
 
-let itemBatch: RawItemWithBuffer[] = [];
+const pendingUploads: Promise<void>[] = [];
 
 const failedUrls = new Set(
   fs.existsSync(path.join(process.cwd(), "failed_urls.txt"))
@@ -61,51 +64,38 @@ const seedUrls = readFileSync(path.join(process.cwd(), "seed.txt"), "utf8")
   .filter((url): url is string => url !== null)
   .filter((url) => !failedUrls.has(url) && !cachedUrls.has(url));
 
-async function uploadBatch(items: RawItemWithBuffer[]): Promise<void> {
+const EXCLUDE_PATTERNS = [
+  new RegExp(`\\.(${PAGE_TYPES_TO_EXCLUDE.join("|")})$`, "i"),
+  new RegExp(`(${TRUSTED_WEBSITES_TO_EXCLUDE.join("|").replace(/\./g, "\\.")})`, "i"),
+  /^javascript:/i,
+  /^mailto:/i,
+  /^tel:/i,
+  /^#/,
+  /^void\(0\)/i,
+];
+
+async function uploadBatch(items: RawItem[]): Promise<void> {
   if (items.length === 0) return;
 
   try {
-    const urlsToCache: string[] = [];
-    const processedItemsMap = new Map<string, RawItem>();
-
-    for (const item of items) {
-      const screenshotUrl = await uploadScreenshotToStorage(item.screenshot_buffer, item.url);
-
-      const processedItem: RawItem = {
-        url: item.url,
-        hostname: item.hostname,
-        domain: item.domain,
-        title: item.title,
-        favicon: item.favicon,
-        images: item.images,
-        screenshot: screenshotUrl || "",
-      };
-
-      const normalizedUrl = validateAndNormalizeUrl(item.url);
-
-      if (normalizedUrl) {
-        urlsToCache.push(normalizedUrl);
-      }
-
-      processedItemsMap.set(item.url, processedItem);
-    }
-
-    const uniqueItems = Array.from(processedItemsMap.values());
+    const uniqueItems = Array.from(new Map(items.map((item) => [item.url, item])).values());
 
     const { error } = await supabase.from("scraped_images").upsert(uniqueItems, {
       onConflict: "url",
     });
 
     if (error) {
-      log.error(`Error inserting ${uniqueItems.length} items to database: ${error.message}`);
+      log.error(`Error inserting ${uniqueItems.length} items: ${error.message}`);
       return;
     }
 
     await Dataset.pushData(uniqueItems);
 
-    if (urlsToCache.length > 0) {
-      await addToCache(urlsToCache, "Successful database upload");
-    }
+    const urlsToCache = uniqueItems
+      .map((item) => validateAndNormalizeUrl(item.url))
+      .filter((url): url is string => url !== null);
+
+    await addToCache(urlsToCache, "Successful database upload");
 
     log.info(`SUCCESS: Uploaded ${uniqueItems.length} items to database`);
   } catch (error) {
@@ -113,21 +103,44 @@ async function uploadBatch(items: RawItemWithBuffer[]): Promise<void> {
   }
 }
 
-async function processBatch(): Promise<void> {
-  if (itemBatch.length >= BATCH_SIZE) {
-    const batchToUpload = itemBatch.splice(0, BATCH_SIZE);
+function dispatchBatch(items: RawItem[]): void {
+  if (items.length === 0) return;
+  const upload = uploadBatch(items);
+  pendingUploads.push(upload);
+  upload.finally(() => {
+    const idx = pendingUploads.indexOf(upload);
+    if (idx !== -1) pendingUploads.splice(idx, 1);
+  });
+}
 
-    await uploadBatch(batchToUpload);
+function processBatch(): void {
+  if (itemBatch.length >= BATCH_SIZE) {
+    dispatchBatch(itemBatch.splice(0, BATCH_SIZE));
   }
 }
 
-async function uploadRemainingItems(): Promise<void> {
+async function flushPendingUploads(): Promise<void> {
   if (itemBatch.length > 0) {
-    log.info(`Uploading remaining ${itemBatch.length} items...`);
-
-    await uploadBatch(itemBatch);
-
+    log.info(`Flushing remaining ${itemBatch.length} items...`);
+    dispatchBatch(itemBatch);
     itemBatch = [];
+  }
+
+  if (pendingUploads.length === 0) return;
+
+  log.info(`Waiting for ${pendingUploads.length} in-flight uploads...`);
+
+  const timeout = new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 30_000));
+
+  const result = await Promise.race([
+    Promise.allSettled(pendingUploads).then(() => "done" as const),
+    timeout,
+  ]);
+
+  if (result === "timeout") {
+    log.error(`Flush timed out — ${pendingUploads.length} uploads may be incomplete`);
+  } else {
+    log.info("All uploads completed successfully");
   }
 }
 
@@ -136,9 +149,7 @@ async function addToFailedUrls(url: string, reason: string): Promise<void> {
 
   if (normalizedUrl && !failedUrls.has(normalizedUrl)) {
     failedUrls.add(normalizedUrl);
-
     await appendFile("failed_urls.txt", normalizedUrl + "\n");
-
     log.info(`${reason} | ${url} added to failed_urls.txt`);
   }
 }
@@ -146,19 +157,15 @@ async function addToFailedUrls(url: string, reason: string): Promise<void> {
 async function addToCache(urls: string | string[], reason: string): Promise<void> {
   const urlArray = Array.isArray(urls) ? urls : [urls];
   const newUrls = urlArray.filter((url) => {
-    const normalizedUrl = validateAndNormalizeUrl(url.trim());
-
-    return normalizedUrl && !cachedUrls.has(normalizedUrl);
+    const normalized = validateAndNormalizeUrl(url.trim());
+    return normalized && !cachedUrls.has(normalized);
   });
 
   if (newUrls.length > 0) {
     await appendFile("cache.txt", newUrls.join("\n") + "\n");
     newUrls.forEach((url) => {
-      const normalizedUrl = validateAndNormalizeUrl(url.trim());
-
-      if (normalizedUrl) {
-        cachedUrls.add(normalizedUrl);
-      }
+      const normalized = validateAndNormalizeUrl(url.trim());
+      if (normalized) cachedUrls.add(normalized);
     });
     log.info(`${reason} | Added ${newUrls.length} new URLs to cache.txt`);
   }
@@ -166,7 +173,6 @@ async function addToCache(urls: string | string[], reason: string): Promise<void
 
 async function cleanupStorage(): Promise<void> {
   const storagePath = path.join(process.cwd(), "storage");
-
   try {
     if (fs.existsSync(storagePath)) {
       fs.rmSync(storagePath, { recursive: true, force: true });
@@ -176,6 +182,31 @@ async function cleanupStorage(): Promise<void> {
   }
 }
 
+function needsJsRendering($: CheerioAPI): boolean {
+  const hasReactRoot = $("div#root, div#app, div#__next, div#__nuxt").length > 0;
+
+  const hasNoscriptContent = $("noscript").text().trim().length > 50;
+
+  if (hasReactRoot || hasNoscriptContent) return true;
+
+  const hasFrameworkAttrs =
+    $("[ng-app], [ng-controller], [v-app], [data-server-rendered]").length > 0;
+
+  if (hasFrameworkAttrs) return true;
+
+  const hasImages = $("img[src]").length > 0;
+
+  const hasStaticContent = $("p, article, main, section").length > 0;
+
+  const bodyText = $("body").text().trim();
+
+  const isEffectivelyEmpty = bodyText.length < 100 && !hasStaticContent;
+
+  if (hasImages && isEffectivelyEmpty) return true;
+
+  return isEffectivelyEmpty;
+}
+
 async function startCrawler(): Promise<void> {
   await cleanupStorage();
 
@@ -183,23 +214,105 @@ async function startCrawler(): Promise<void> {
 
   log.info(`Starting with ${seedUrls.length} seed URLs after filtering`);
 
-  const requestQueue = await RequestQueue.open(`QUEUE-${Date.now()}`);
+  const cheerioQueue = await RequestQueue.open(`CHEERIO-QUEUE-${Date.now()}`);
 
-  const crawler = new PlaywrightCrawler({
-    requestQueue,
-    headless: true,
-    minConcurrency: 15,
+  const playwrightQueue = await RequestQueue.open(`PLAYWRIGHT-QUEUE-${Date.now()}`);
+
+  const cheerioCrawler = new CheerioCrawler({
+    requestQueue: cheerioQueue,
     maxConcurrency: 20,
     maxRequestRetries: 1,
     requestHandlerTimeoutSecs: 30,
+
     failedRequestHandler: async ({ request }) => {
-      await addToFailedUrls(request.url, "Too many retries");
+      await addToFailedUrls(request.url, "Cheerio: too many retries");
     },
+
+    async requestHandler({ request, $, enqueueLinks }) {
+      const normalizedLoadedUrl = validateAndNormalizeUrl(request.loadedUrl);
+
+      if (normalizedLoadedUrl && cachedUrls.has(normalizedLoadedUrl)) {
+        log.info(`SKIPPING (cached): ${request.loadedUrl}`);
+        return;
+      }
+
+      if (needsJsRendering($)) {
+        log.info(`ESCALATING to Playwright: ${request.loadedUrl}`);
+        await playwrightQueue.addRequest({ url: request.loadedUrl });
+        return;
+      }
+
+      await enqueueLinks({
+        requestQueue: cheerioQueue,
+        strategy: "all",
+        exclude: EXCLUDE_PATTERNS,
+        transformRequestFunction: (req) => {
+          const normalized = validateAndNormalizeUrl(req.url);
+          if (!normalized || cachedUrls.has(normalized) || failedUrls.has(normalized)) return false;
+          return req;
+        },
+      });
+
+      const parsedUrl = parse(request.loadedUrl);
+      const title = $("title").text().trim() || "N/A";
+      const favicon =
+        $('link[rel*="icon"]').attr("href") || new URL("/favicon.ico", request.loadedUrl).href;
+
+      const imageUrls = $("img")
+        .toArray()
+        .map((el) => ({
+          src: (() => {
+            try {
+              return new URL($(el).attr("src") || "", request.loadedUrl).href;
+            } catch {
+              return "";
+            }
+          })(),
+          width: parseInt($(el).attr("width") || "0", 10),
+          height: parseInt($(el).attr("height") || "0", 10),
+          alt: $(el).attr("alt") || "N/A",
+        }))
+        .filter((img) => img.src !== "" && isValidImageUrl(img.src));
+
+      if (imageUrls.length === 0) {
+        await addToFailedUrls(request.loadedUrl, "Cheerio: no images found");
+        return;
+      }
+
+      itemBatch.push({
+        url: request.loadedUrl,
+        hostname: parsedUrl.hostname,
+        domain: parsedUrl.domain,
+        title,
+        favicon,
+        images: imageUrls,
+      });
+
+      log.info(
+        `[CHEERIO] ${title} | ${parsedUrl.hostname} | ${imageUrls.length} image(s) | Batch: ${itemBatch.length}/${BATCH_SIZE}`,
+      );
+
+      processBatch();
+    },
+  });
+
+  const playwrightCrawler = new PlaywrightCrawler({
+    requestQueue: playwrightQueue,
+    headless: true,
+    minConcurrency: 10,
+    maxConcurrency: 20,
+    maxRequestRetries: 1,
+    requestHandlerTimeoutSecs: 30,
+
+    failedRequestHandler: async ({ request }) => {
+      await addToFailedUrls(request.url, "Playwright: too many retries");
+    },
+
     async requestHandler({ request, page, enqueueLinks }) {
       const normalizedLoadedUrl = validateAndNormalizeUrl(request.loadedUrl);
 
       if (normalizedLoadedUrl && cachedUrls.has(normalizedLoadedUrl)) {
-        log.info(`SKIPPING: Already cached ${request.loadedUrl}`);
+        log.info(`SKIPPING (cached): ${request.loadedUrl}`);
         return;
       }
 
@@ -215,86 +328,60 @@ async function startCrawler(): Promise<void> {
       await scrollToBottom(page);
 
       await enqueueLinks({
+        requestQueue: cheerioQueue,
         strategy: "all",
-        exclude: [
-          // Exclude file extensions
-          new RegExp(`\\.(${PAGE_TYPES_TO_EXCLUDE.join("|")})$`, "i"),
-          // Exclude trusted websites (matches domain anywhere in URL)
-          new RegExp(`(${TRUSTED_WEBSITES_TO_EXCLUDE.join("|").replace(/\./g, "\\.")})`, "i"),
-          // Exclude "void(0)" placeholders
-          /^javascript:/i,
-          /^mailto:/i,
-          /^tel:/i,
-          /^#/,
-          /^void\(0\)/i,
-        ],
-        transformRequestFunction: (request) => {
-          const normalizedUrl = validateAndNormalizeUrl(request.url);
-
-          if (!normalizedUrl || cachedUrls.has(normalizedUrl) || failedUrls.has(normalizedUrl)) {
-            return false;
-          }
-
-          return request;
+        exclude: EXCLUDE_PATTERNS,
+        transformRequestFunction: (req) => {
+          const normalized = validateAndNormalizeUrl(req.url);
+          if (!normalized || cachedUrls.has(normalized) || failedUrls.has(normalized)) return false;
+          return req;
         },
       });
 
       const parsedUrl = parse(request.loadedUrl);
-
       const title = await page.title();
-
       const favicon = await page
         .$eval('link[rel*="icon"]', (link) => (link as HTMLLinkElement).href)
         .catch(() => null);
 
-      const faviconUrl = favicon || new URL("/favicon.ico", page.url()).href;
-
-      const rawImageUrls = await page.$$eval("img", (imgs) => {
-        return imgs
-          .filter((img) => img.naturalWidth > 200 && img.naturalHeight > 200)
-          .map((img) => ({
-            src: img.src,
-            width: img.naturalWidth,
-            height: img.naturalHeight,
-            alt: img.alt || "N/A",
-          }));
-      });
-
-      const imageUrls = rawImageUrls.filter((img) => isValidImageUrl(img.src));
+      const imageUrls = (
+        await page.$$eval("img", (imgs) =>
+          imgs
+            .filter((img) => img.naturalWidth > 100 && img.naturalHeight > 100)
+            .map((img) => ({
+              src: img.src,
+              width: img.naturalWidth,
+              height: img.naturalHeight,
+              alt: img.alt || "N/A",
+            })),
+        )
+      ).filter((img) => isValidImageUrl(img.src));
 
       if (imageUrls.length === 0) {
-        await addToFailedUrls(request.loadedUrl, `No images found`);
+        await addToFailedUrls(request.loadedUrl, "Playwright: no images found");
         return;
       }
 
-      const screenshotBuffer = await page.screenshot({
-        type: "png",
-        fullPage: true,
-      });
-
-      const rawItem: RawItemWithBuffer = {
+      itemBatch.push({
         url: request.loadedUrl,
         hostname: parsedUrl.hostname,
         domain: parsedUrl.domain,
-        title: title,
-        favicon: faviconUrl,
+        title,
+        favicon: favicon || new URL("/favicon.ico", page.url()).href,
         images: imageUrls,
-        screenshot_buffer: screenshotBuffer,
-      };
-
-      itemBatch.push(rawItem);
+      });
 
       log.info(
-        `SCRAPED: ${title} | ${parsedUrl.hostname} | ${request.loadedUrl} | ${imageUrls.length} image(s) | Batch: ${itemBatch.length}/${BATCH_SIZE}`,
+        `[PLAYWRIGHT] ${title} | ${parsedUrl.hostname} | ${imageUrls.length} image(s) | Batch: ${itemBatch.length}/${BATCH_SIZE}`,
       );
 
-      await processBatch();
+      processBatch();
     },
   });
 
-  await crawler.run(seedUrls);
+  await Promise.all([cheerioCrawler.run(seedUrls), playwrightCrawler.run([])]);
 
-  await uploadRemainingItems();
+  await flushPendingUploads();
 
   await Dataset.exportToCSV(Date.now().toString());
 

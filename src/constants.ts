@@ -1,6 +1,4 @@
-export const BATCH_SIZE = 25;
-
-export const BUCKET_NAME = "pixels-screenshots";
+export const BATCH_SIZE = 50;
 
 export const PAGE_TYPES_TO_EXCLUDE = [
   "pdf",

@@ -3,9 +3,6 @@ import type { Page } from "playwright";
 import { log } from "crawlee";
 import crypto from "crypto";
 
-import { BUCKET_NAME } from "./constants.js";
-import { supabase } from "./supabase.js";
-
 export function isDevMode() {
   return process.env.NODE_ENV === "development";
 }
@@ -14,34 +11,18 @@ export function generateRandomString() {
   return crypto.randomBytes(16).toString("hex");
 }
 
-export async function shouldSkipPage(page: Page): Promise<boolean> {
-  try {
-    const content = await page.content();
-
-    if (!content) return true;
-
-    if (!content.trim().startsWith("<!DOCTYPE html") && !content.toLowerCase().includes("<html")) {
-      return true;
-    }
-
-    return false;
-  } catch {
-    return true;
-  }
-}
-
-export function isValidImageUrl(src: string) {
-  if (src.startsWith("data:")) return false;
-
-  if (src.startsWith("blob:")) return false;
-
+export function isValidImageUrl(src: string): boolean {
   if (!src || src.length < 10) return false;
-
+  if (src.startsWith("data:")) return false;
+  if (src.startsWith("blob:")) return false;
   if (!src.startsWith("http://") && !src.startsWith("https://")) return false;
 
-  if (src.toLowerCase().includes(".svg")) return false;
-
-  if (src.toLowerCase().includes(".gif")) return false;
+  try {
+    const pathname = new URL(src).pathname.toLowerCase();
+    if (pathname.endsWith(".svg") || pathname.endsWith(".gif")) return false;
+  } catch {
+    return false;
+  }
 
   const lowercaseSrc = src.toLowerCase();
 
@@ -59,26 +40,6 @@ export function isValidImageUrl(src: string) {
   ];
 
   return !skipPatterns.some((pattern) => lowercaseSrc.includes(pattern));
-}
-
-export async function scrollToBottom(page: Page, maxScrolls: number = 10): Promise<void> {
-  let scrollCount = 0;
-  let currentHeight = 0;
-  let previousHeight = 0;
-
-  do {
-    previousHeight = currentHeight;
-
-    await page.evaluate(() => window.scrollBy(0, window.innerHeight));
-
-    await page.waitForTimeout(500);
-
-    currentHeight = await page.evaluate(() =>
-      Math.max(document.body.scrollHeight, document.documentElement.scrollHeight),
-    );
-
-    scrollCount++;
-  } while (currentHeight > previousHeight && scrollCount < maxScrolls);
 }
 
 export function validateAndNormalizeUrl(url: string): string | null {
@@ -112,51 +73,64 @@ export function validateAndNormalizeUrl(url: string): string | null {
       urlObj.hostname = urlObj.hostname.slice(4);
     }
 
-    return urlObj.toString();
+    urlObj.hash = "";
+
+    const normalized = urlObj.toString().replace(/\/$/, "");
+
+    return normalized;
   } catch (error) {
     log.warning(`Invalid URL skipped: ${url} - ${error}`);
     return null;
   }
 }
 
-export async function uploadScreenshotToStorage(
-  buffer: Buffer,
-  url: string,
-): Promise<string | null> {
+export async function shouldSkipPage(page: Page): Promise<boolean> {
   try {
-    const { data: bucketData, error: getError } = await supabase.storage.getBucket(BUCKET_NAME);
+    const response = page.mainFrame().url();
 
-    if (getError || !bucketData) {
-      const { error: createError } = await supabase.storage.createBucket(BUCKET_NAME, {
-        public: true,
-        allowedMimeTypes: ["image/*"],
-      });
+    if (!response) return true;
 
-      if (createError) {
-        log.error(`Error creating bucket '${BUCKET_NAME}': ${createError.message}`);
-        return null;
-      }
-    }
+    const [title, bodyText, hasHtml] = await Promise.all([
+      page.title(),
+      page
+        .locator("body")
+        .innerText()
+        .catch(() => ""),
+      page.locator("html").count(),
+    ]);
 
-    const fileName = `${crypto.createHash("sha256").update(url).digest("hex")}.png`;
+    if (!hasHtml) return true;
 
-    const { error: uploadError } = await supabase.storage
-      .from(BUCKET_NAME)
-      .upload(fileName, buffer, {
-        upsert: true,
-        contentType: "image/png",
-      });
+    const lowerTitle = title.toLowerCase();
+    if (
+      lowerTitle.includes("404") ||
+      lowerTitle.includes("403") ||
+      lowerTitle.includes("error") ||
+      lowerTitle.includes("not found") ||
+      lowerTitle.includes("access denied")
+    )
+      return true;
 
-    if (uploadError) {
-      log.error(`Error uploading screenshot for ${url}: ${uploadError.message}`);
-      return null;
-    }
+    if (bodyText.trim().length < 100) return true;
 
-    const { data: publicUrlData } = supabase.storage.from(BUCKET_NAME).getPublicUrl(fileName);
-
-    return publicUrlData.publicUrl;
-  } catch (error) {
-    log.error(`Failed to upload screenshot for ${url}: ${error}`);
-    return null;
+    return false;
+  } catch {
+    return true;
   }
+}
+
+export async function scrollToBottom(page: Page, maxScrolls: number = 10): Promise<void> {
+  for (let i = 0; i < maxScrolls; i++) {
+    const previousHeight = await page.evaluate(() => document.documentElement.scrollHeight);
+
+    await page.mouse.wheel(0, 800);
+
+    await page.waitForTimeout(500);
+
+    const newHeight = await page.evaluate(() => document.documentElement.scrollHeight);
+
+    if (newHeight <= previousHeight) break;
+  }
+
+  await page.evaluate(() => window.scrollTo(0, 0));
 }
