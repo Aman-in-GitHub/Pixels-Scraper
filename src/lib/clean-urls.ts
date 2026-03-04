@@ -1,4 +1,4 @@
-import fs from "fs";
+import fs from "node:fs";
 
 const seedFile = "seed.txt";
 const failedFile = "failed_urls.txt";

@@ -322,3 +322,13 @@ export const TRUSTED_WEBSITES_TO_EXCLUDE = [
   "500px.com",
   "smugmug.com",
 ];
+
+export const EXCLUDE_PATTERNS = [
+  new RegExp(`\\.(${PAGE_TYPES_TO_EXCLUDE.join("|")})$`, "i"),
+  new RegExp(`(${TRUSTED_WEBSITES_TO_EXCLUDE.join("|").replace(/\./g, "\\.")})`, "i"),
+  /^javascript:/i,
+  /^mailto:/i,
+  /^tel:/i,
+  /^#/,
+  /^void\(0\)/i,
+];
