@@ -1,5 +1,19 @@
 export const BATCH_SIZE = 50;
 
+export const PLAYWRIGHT_BLOCKED_RESOURCE_TYPES = ["font", "media", "manifest", "texttrack"];
+
+export const PLAYWRIGHT_ANALYTICS_HOST_SUFFIXES = [
+  "google-analytics.com",
+  "googletagmanager.com",
+  "doubleclick.net",
+  "hotjar.com",
+  "segment.io",
+  "mixpanel.com",
+  "amplitude.com",
+  "clarity.ms",
+  "fullstory.com",
+];
+
 export const PAGE_TYPES_TO_EXCLUDE = [
   "pdf",
   "doc",

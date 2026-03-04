@@ -15,9 +15,10 @@ import { scrapedImages } from "@/db/schema";
 import { logger } from "@/lib/logger";
 
 const utilsLogger = logger.child({ module: "utils" });
-const DEFAULT_SEED_ENQUEUE_BATCH_SIZE = 1_000;
-const FLUSH_TIMEOUT_MS = 30_000;
+
 const MAX_FLUSH_PASSES = 5;
+const FLUSH_TIMEOUT_MS = 30_000;
+const DEFAULT_SEED_ENQUEUE_BATCH_SIZE = 1_000;
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
@@ -165,44 +166,217 @@ export async function scrollToBottom(
   maxScrolls: number = 8,
   waitAfterScrollMs: number = 200,
 ): Promise<void> {
-  for (let i = 0; i < maxScrolls; i++) {
-    const previousHeight = await page.evaluate(() => document.documentElement.scrollHeight);
+  const MAX_SCROLL_TIME_MS = 1_200;
 
-    await page.mouse.wheel(0, 1200);
+  const STAGNANT_ROUNDS_BEFORE_STOP = 2;
+
+  const MIN_IMAGE_GOAL_BEFORE_SCROLL = 12;
+
+  const getScrollSignals = async (): Promise<{
+    scrollHeight: number;
+    uniqueImageCandidateCount: number;
+    hasLazySignals: boolean;
+  }> =>
+    page.evaluate(() => {
+      const toAbsoluteHttpUrl = (value: string | null): string | null => {
+        if (!value) return null;
+        const trimmed = value.trim();
+        if (!trimmed) return null;
+
+        try {
+          const absoluteUrl = new URL(trimmed, window.location.href).href;
+          if (!absoluteUrl.startsWith("http://") && !absoluteUrl.startsWith("https://")) {
+            return null;
+          }
+          return absoluteUrl;
+        } catch {
+          return null;
+        }
+      };
+
+      const addSrcsetEntries = (target: Set<string>, srcset: string | null): void => {
+        if (!srcset) return;
+        for (const candidate of srcset.split(",")) {
+          const urlPart = candidate.trim().split(/\s+/)[0] ?? "";
+          const absoluteUrl = toAbsoluteHttpUrl(urlPart);
+          if (absoluteUrl) target.add(absoluteUrl);
+        }
+      };
+
+      const imageCandidates = new Set<string>();
+      const imgNodes = Array.from(document.querySelectorAll("img"));
+
+      for (const img of imgNodes) {
+        const currentSrcUrl = toAbsoluteHttpUrl(img.currentSrc || null);
+        if (currentSrcUrl) imageCandidates.add(currentSrcUrl);
+
+        const attributeKeys = [
+          "src",
+          "data-src",
+          "data-original",
+          "data-lazy-src",
+          "data-srcset",
+          "srcset",
+        ] as const;
+
+        for (const key of attributeKeys) {
+          const value = img.getAttribute(key);
+          if (!value) continue;
+
+          if (key.includes("srcset")) {
+            addSrcsetEntries(imageCandidates, value);
+            continue;
+          }
+
+          const absoluteUrl = toAbsoluteHttpUrl(value);
+          if (absoluteUrl) imageCandidates.add(absoluteUrl);
+        }
+      }
+
+      const sourceNodes = Array.from(
+        document.querySelectorAll("source[srcset], source[data-srcset]"),
+      );
+      for (const source of sourceNodes) {
+        addSrcsetEntries(imageCandidates, source.getAttribute("srcset"));
+        addSrcsetEntries(imageCandidates, source.getAttribute("data-srcset"));
+      }
+
+      const hasLazySignals =
+        document.querySelector(
+          'img[loading="lazy"], img[data-src], img[data-srcset], img[data-lazy-src], img[data-original], [class*="lazy"], [data-infinite-scroll]',
+        ) !== null;
+
+      return {
+        scrollHeight: document.documentElement?.scrollHeight ?? 0,
+        uniqueImageCandidateCount: imageCandidates.size,
+        hasLazySignals,
+      };
+    });
+
+  const scrollStartMs = Date.now();
+
+  const scrollStepPixels = Math.max(page.viewportSize()?.height ?? 1200, 1200);
+
+  let {
+    scrollHeight: previousHeight,
+    uniqueImageCandidateCount,
+    hasLazySignals,
+  } = await getScrollSignals();
+
+  if (uniqueImageCandidateCount >= MIN_IMAGE_GOAL_BEFORE_SCROLL && !hasLazySignals) {
+    return;
+  }
+
+  let stagnantRounds = 0;
+
+  for (let i = 0; i < maxScrolls; i++) {
+    if (Date.now() - scrollStartMs >= MAX_SCROLL_TIME_MS) break;
+
+    await page.mouse.wheel(0, scrollStepPixels);
 
     await page.waitForTimeout(waitAfterScrollMs);
 
-    const newHeight = await page.evaluate(() => document.documentElement.scrollHeight);
+    const signals = await getScrollSignals();
+    const hasHeightGrowth = signals.scrollHeight > previousHeight;
+    const hasImageGrowth = signals.uniqueImageCandidateCount > uniqueImageCandidateCount;
 
-    if (newHeight <= previousHeight) break;
+    if (!hasHeightGrowth && !hasImageGrowth) {
+      stagnantRounds += 1;
+    } else {
+      stagnantRounds = 0;
+    }
+
+    previousHeight = Math.max(previousHeight, signals.scrollHeight);
+    uniqueImageCandidateCount = Math.max(
+      uniqueImageCandidateCount,
+      signals.uniqueImageCandidateCount,
+    );
+    hasLazySignals = signals.hasLazySignals;
+
+    if (stagnantRounds >= STAGNANT_ROUNDS_BEFORE_STOP) break;
+
+    if (uniqueImageCandidateCount >= MIN_IMAGE_GOAL_BEFORE_SCROLL && !hasLazySignals) {
+      break;
+    }
   }
-
-  await page.evaluate(() => window.scrollTo(0, 0));
 }
 
 export function needsJsRendering($: CheerioAPI): boolean {
-  const hasReactRoot = $("div#root, div#app, div#__next, div#__nuxt").length > 0;
+  const normalizedBodyText = $("body").text().replace(/\s+/g, " ").trim();
+  const bodyTextLength = normalizedBodyText.length;
 
-  const hasNoscriptContent = $("noscript").text().trim().length > 50;
+  const staticBlockCount = $("p, article, main, section, li").length;
+  const hasStaticContent = staticBlockCount > 0;
 
-  if (hasReactRoot || hasNoscriptContent) return true;
+  const frameworkRootCount = $(
+    "div#root, div#app, div#__next, div#__nuxt, [data-reactroot]",
+  ).length;
+  const hasFrameworkRoots = frameworkRootCount > 0;
 
   const hasFrameworkAttrs =
-    $("[ng-app], [ng-controller], [v-app], [data-server-rendered]").length > 0;
+    $("[ng-app], [ng-controller], [ng-version], [v-app], [data-server-rendered]").length > 0;
 
-  if (hasFrameworkAttrs) return true;
+  const hasHydrationData =
+    $('script#__NEXT_DATA__, script#__NUXT_DATA__, script[data-rh="true"]').length > 0;
 
-  const hasImages = $("img[src]").length > 0;
+  const scriptCount = $("script").length;
+  const hasChunkLikeScripts =
+    $('script[src*="_next/"], script[src*="chunk"], script[src*="webpack"]').length > 0;
 
-  const hasStaticContent = $("p, article, main, section").length > 0;
+  const noscriptTextLength = $("noscript").text().replace(/\s+/g, " ").trim().length;
+  const hasLargeNoscriptContent = noscriptTextLength > 120;
 
-  const bodyText = $("body").text().trim();
+  const imageNodes = $("img[src]").toArray();
+  const usableImageHintCount = imageNodes.filter((el) => {
+    const src = ($(el).attr("src") ?? "").trim().toLowerCase();
+    if (!src) return false;
+    if (src.startsWith("data:") || src.startsWith("blob:")) return false;
+    return true;
+  }).length;
 
-  const isEffectivelyEmpty = bodyText.length < 100 && !hasStaticContent;
+  const lazyImageSignalsCount = $(
+    'img[loading="lazy"], img[data-src], img[data-srcset], img[data-lazy-src], img[data-original], source[data-srcset], [class*="lazy"]',
+  ).length;
+  const hasLazyImageSignals = lazyImageSignalsCount > 0;
 
-  if (hasImages && isEffectivelyEmpty) return true;
+  const isEffectivelyEmpty = bodyTextLength < 100 && !hasStaticContent;
+  if (isEffectivelyEmpty) return true;
 
-  return isEffectivelyEmpty;
+  const hasStrongJsSignals =
+    hasHydrationData ||
+    (hasFrameworkRoots && (hasLazyImageSignals || bodyTextLength < 220)) ||
+    (hasChunkLikeScripts && bodyTextLength < 200);
+
+  if (hasStrongJsSignals && usableImageHintCount < 8) return true;
+
+  const hasStrongStaticSignals =
+    usableImageHintCount >= 10 &&
+    bodyTextLength >= 220 &&
+    staticBlockCount >= 3 &&
+    !hasLazyImageSignals;
+
+  if (hasStrongStaticSignals) return false;
+
+  let jsScore = 0;
+
+  if (hasHydrationData) jsScore += 4;
+  if (hasFrameworkRoots) jsScore += 3;
+  if (hasFrameworkAttrs) jsScore += 2;
+  if (hasChunkLikeScripts) jsScore += 1;
+  if (hasLargeNoscriptContent) jsScore += 1;
+  if (hasLazyImageSignals) jsScore += 2;
+  if (scriptCount >= 10) jsScore += 1;
+  if (scriptCount >= 18) jsScore += 1;
+  if (bodyTextLength < 150) jsScore += 2;
+  else if (bodyTextLength < 260) jsScore += 1;
+  if (!hasStaticContent) jsScore += 1;
+  if (usableImageHintCount === 0) jsScore += 1;
+
+  if (usableImageHintCount >= 6 && bodyTextLength >= 220) jsScore -= 3;
+  if (staticBlockCount >= 4 && bodyTextLength >= 300) jsScore -= 2;
+  if (scriptCount <= 2 && bodyTextLength >= 400) jsScore -= 1;
+
+  return jsScore >= 5;
 }
 
 export function loadNormalizedUrlSet(fileName: string): Set<string> {

@@ -1,3 +1,5 @@
+import type { Page } from "playwright";
+
 import {
   CheerioCrawler,
   Dataset,
@@ -9,7 +11,11 @@ import {
 } from "crawlee";
 import { parse } from "tldts";
 
-import { BATCH_SIZE } from "@/lib/constants.js";
+import {
+  BATCH_SIZE,
+  PLAYWRIGHT_ANALYTICS_HOST_SUFFIXES,
+  PLAYWRIGHT_BLOCKED_RESOURCE_TYPES,
+} from "@/lib/constants.js";
 import { logger } from "@/lib/logger.js";
 import { shouldExcludeCrawlUrl } from "@/lib/url-filters.js";
 import {
@@ -33,6 +39,8 @@ import {
 const crawlerLogger = logger.child({ module: "crawler" });
 
 const PLAYWRIGHT_FALLBACK_FLAG = "__playwrightFallbackQueued";
+const PLAYWRIGHT_BLOCKED_RESOURCE_TYPE_SET = new Set(PLAYWRIGHT_BLOCKED_RESOURCE_TYPES);
+const PLAYWRIGHT_RESOURCE_BLOCKING_ATTACHED_PAGES = new WeakSet<Page>();
 
 crawleeLog.setLevel(LogLevel.OFF);
 
@@ -102,6 +110,33 @@ function isTlsNavigationError(error: unknown): boolean {
   );
 }
 
+function getRequestHostname(url: string): string {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function isAnalyticsHostname(hostname: string): boolean {
+  return PLAYWRIGHT_ANALYTICS_HOST_SUFFIXES.some(
+    (suffix) => hostname === suffix || hostname.endsWith(`.${suffix}`),
+  );
+}
+
+function shouldBlockPlaywrightRequest(url: string, resourceType: string): boolean {
+  if (PLAYWRIGHT_BLOCKED_RESOURCE_TYPE_SET.has(resourceType)) return true;
+
+  const hostname = getRequestHostname(url);
+  if (!hostname || !isAnalyticsHostname(hostname)) return false;
+
+  if (resourceType === "document" || resourceType === "image" || resourceType === "stylesheet") {
+    return false;
+  }
+
+  return true;
+}
+
 async function queuePlaywrightFallbackForTlsError(
   request: Request,
   error: unknown,
@@ -141,7 +176,7 @@ async function startCrawler(): Promise<void> {
 
   const cheerioCrawler = new CheerioCrawler({
     requestQueue: cheerioQueue,
-    minConcurrency: 5,
+    minConcurrency: 10,
     maxConcurrency: 15,
     maxRequestRetries: 1,
     requestHandlerTimeoutSecs: 30,
@@ -254,11 +289,32 @@ async function startCrawler(): Promise<void> {
   const playwrightCrawler = new PlaywrightCrawler({
     requestQueue: playwrightQueue,
     headless: true,
-    minConcurrency: 5,
+    keepAlive: true,
+    minConcurrency: 10,
     maxConcurrency: 15,
     maxRequestRetries: 1,
     requestHandlerTimeoutSecs: 30,
-    keepAlive: true,
+
+    preNavigationHooks: [
+      async ({ page }, gotoOptions) => {
+        gotoOptions.waitUntil = "domcontentloaded";
+
+        if (PLAYWRIGHT_RESOURCE_BLOCKING_ATTACHED_PAGES.has(page)) return;
+
+        await page.route("**/*", async (route) => {
+          const req = route.request();
+
+          if (shouldBlockPlaywrightRequest(req.url(), req.resourceType())) {
+            await route.abort().catch(() => undefined);
+            return;
+          }
+
+          await route.continue().catch(() => undefined);
+        });
+
+        PLAYWRIGHT_RESOURCE_BLOCKING_ATTACHED_PAGES.add(page);
+      },
+    ],
 
     failedRequestHandler: async ({ request }) => {
       await addToFailedUrls(failedUrls, request.url, "Playwright: too many retries");
