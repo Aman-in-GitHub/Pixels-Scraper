@@ -9,16 +9,17 @@ import {
 } from "crawlee";
 import { parse } from "tldts";
 
-import { BATCH_SIZE, EXCLUDE_PATTERNS } from "@/lib/constants.js";
+import { BATCH_SIZE } from "@/lib/constants.js";
 import { logger } from "@/lib/logger.js";
+import { shouldExcludeCrawlUrl } from "@/lib/url-filters.js";
 import {
   addToCache,
   addToFailedUrls,
   cleanupStorage,
+  enqueueSeedUrls,
   flushPendingUploads,
   isValidImageUrl,
   loadNormalizedUrlSet,
-  loadSeedUrls,
   needsJsRendering,
   processBatch,
   scrollToBottom,
@@ -37,14 +38,35 @@ crawleeLog.setLevel(LogLevel.OFF);
 
 const batchContext: BatchContext = { itemBatch: [], pendingUploads: [] };
 
-const cachedUrls = loadNormalizedUrlSet("cache.txt");
+const cachedUrls = loadNormalizedUrlSet("cached_urls.txt");
 
 const failedUrls = loadNormalizedUrlSet("failed_urls.txt");
 
-const seedUrls = loadSeedUrls("seed.txt", failedUrls, cachedUrls);
-
 const uploadBatchHandler = (items: RawItem[]) =>
   uploadBatch(items, (urls, reason) => addToCache(cachedUrls, urls, reason));
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForQueuesToDrain(
+  queues: RequestQueue[],
+  pollIntervalMs: number = 1_000,
+): Promise<void> {
+  while (true) {
+    const statuses = await Promise.all(queues.map((queue) => queue.isFinished()));
+    if (statuses.every(Boolean)) return;
+    await delay(pollIntervalMs);
+  }
+}
+
+function getNormalizedUrlToEnqueue(url: string): string | null {
+  const normalized = validateAndNormalizeUrl(url);
+  if (!normalized) return null;
+  if (shouldExcludeCrawlUrl(normalized)) return null;
+  if (cachedUrls.has(normalized) || failedUrls.has(normalized)) return null;
+  return normalized;
+}
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error ?? "");
@@ -113,17 +135,17 @@ async function startCrawler(): Promise<void> {
     "Loaded URL caches",
   );
 
-  crawlerLogger.info({ seedCount: seedUrls.length }, "Starting crawl with filtered seed URLs");
-
   const cheerioQueue = await RequestQueue.open(`CHEERIO-QUEUE-${Date.now()}`);
 
   const playwrightQueue = await RequestQueue.open(`PLAYWRIGHT-QUEUE-${Date.now()}`);
 
   const cheerioCrawler = new CheerioCrawler({
     requestQueue: cheerioQueue,
-    maxConcurrency: 20,
+    minConcurrency: 5,
+    maxConcurrency: 15,
     maxRequestRetries: 1,
     requestHandlerTimeoutSecs: 30,
+    keepAlive: true,
 
     preNavigationHooks: [
       async (_ctx, gotOptions) => {
@@ -168,10 +190,11 @@ async function startCrawler(): Promise<void> {
       await enqueueLinks({
         requestQueue: cheerioQueue,
         strategy: "all",
-        exclude: EXCLUDE_PATTERNS,
         transformRequestFunction: (req) => {
-          const normalized = validateAndNormalizeUrl(req.url);
-          if (!normalized || cachedUrls.has(normalized) || failedUrls.has(normalized)) return false;
+          const normalized = getNormalizedUrlToEnqueue(req.url);
+          if (!normalized) return false;
+          req.url = normalized;
+          req.uniqueKey = normalized;
           return req;
         },
       });
@@ -231,10 +254,11 @@ async function startCrawler(): Promise<void> {
   const playwrightCrawler = new PlaywrightCrawler({
     requestQueue: playwrightQueue,
     headless: true,
-    minConcurrency: 10,
-    maxConcurrency: 20,
+    minConcurrency: 5,
+    maxConcurrency: 15,
     maxRequestRetries: 1,
     requestHandlerTimeoutSecs: 30,
+    keepAlive: true,
 
     failedRequestHandler: async ({ request }) => {
       await addToFailedUrls(failedUrls, request.url, "Playwright: too many retries");
@@ -262,10 +286,11 @@ async function startCrawler(): Promise<void> {
       await enqueueLinks({
         requestQueue: cheerioQueue,
         strategy: "all",
-        exclude: EXCLUDE_PATTERNS,
         transformRequestFunction: (req) => {
-          const normalized = validateAndNormalizeUrl(req.url);
-          if (!normalized || cachedUrls.has(normalized) || failedUrls.has(normalized)) return false;
+          const normalized = getNormalizedUrlToEnqueue(req.url);
+          if (!normalized) return false;
+          req.url = normalized;
+          req.uniqueKey = normalized;
           return req;
         },
       });
@@ -320,7 +345,29 @@ async function startCrawler(): Promise<void> {
     },
   });
 
-  await Promise.all([cheerioCrawler.run(seedUrls), playwrightCrawler.run([])]);
+  const cheerioRun = cheerioCrawler.run();
+  const playwrightRun = playwrightCrawler.run();
+
+  try {
+    const { scannedCount, enqueuedCount } = await enqueueSeedUrls(
+      "seed.txt",
+      failedUrls,
+      cachedUrls,
+      cheerioQueue,
+    );
+
+    crawlerLogger.info(
+      { scannedSeedCount: scannedCount, enqueuedSeedCount: enqueuedCount },
+      "Starting crawl with streamed seed URLs",
+    );
+
+    await waitForQueuesToDrain([cheerioQueue, playwrightQueue]);
+  } finally {
+    cheerioCrawler.stop("Stopping crawler after queue drain");
+    playwrightCrawler.stop("Stopping crawler after queue drain");
+  }
+
+  await Promise.all([cheerioRun, playwrightRun]);
 
   await flushPendingUploads(batchContext, uploadBatchHandler);
 

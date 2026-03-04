@@ -1,4 +1,4 @@
-import type { CheerioAPI } from "crawlee";
+import type { CheerioAPI, RequestQueue } from "crawlee";
 import type { Page } from "playwright";
 
 import { Dataset } from "crawlee";
@@ -8,12 +8,16 @@ import fs from "fs";
 import { readFileSync } from "node:fs";
 import { appendFile } from "node:fs/promises";
 import path from "path";
+import { createInterface } from "readline";
 
 import { db } from "@/db";
 import { scrapedImages } from "@/db/schema";
 import { logger } from "@/lib/logger";
 
 const utilsLogger = logger.child({ module: "utils" });
+const DEFAULT_SEED_ENQUEUE_BATCH_SIZE = 1_000;
+const FLUSH_TIMEOUT_MS = 30_000;
+const MAX_FLUSH_PASSES = 5;
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
@@ -117,20 +121,26 @@ export function validateAndNormalizeUrl(url: string): string | null {
 
 export async function shouldSkipPage(page: Page): Promise<boolean> {
   try {
-    const response = page.mainFrame().url();
+    const responseUrl = page.mainFrame().url();
 
-    if (!response) return true;
+    if (!responseUrl) return true;
 
-    const [title, bodyText, hasHtml] = await Promise.all([
-      page.title(),
+    const [title, signals] = await Promise.all([
+      page.title().catch(() => ""),
       page
-        .locator("body")
-        .innerText()
-        .catch(() => ""),
-      page.locator("html").count(),
+        .evaluate(() => {
+          const body = document.body;
+          const hasHtml = Boolean(document.documentElement);
+          if (!hasHtml || !body) return { hasHtml: false, textLength: 0 };
+          return {
+            hasHtml: true,
+            textLength: (body.textContent || "").trim().length,
+          };
+        })
+        .catch(() => ({ hasHtml: false, textLength: 0 })),
     ]);
 
-    if (!hasHtml) return true;
+    if (!signals.hasHtml) return true;
 
     const lowerTitle = title.toLowerCase();
     if (
@@ -142,7 +152,7 @@ export async function shouldSkipPage(page: Page): Promise<boolean> {
     )
       return true;
 
-    if (bodyText.trim().length < 100) return true;
+    if (signals.textLength < 100) return true;
 
     return false;
   } catch {
@@ -150,13 +160,17 @@ export async function shouldSkipPage(page: Page): Promise<boolean> {
   }
 }
 
-export async function scrollToBottom(page: Page, maxScrolls: number = 10): Promise<void> {
+export async function scrollToBottom(
+  page: Page,
+  maxScrolls: number = 8,
+  waitAfterScrollMs: number = 200,
+): Promise<void> {
   for (let i = 0; i < maxScrolls; i++) {
     const previousHeight = await page.evaluate(() => document.documentElement.scrollHeight);
 
-    await page.mouse.wheel(0, 800);
+    await page.mouse.wheel(0, 1200);
 
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(waitAfterScrollMs);
 
     const newHeight = await page.evaluate(() => document.documentElement.scrollHeight);
 
@@ -218,6 +232,58 @@ export function loadSeedUrls(
     .filter((url) => !failedUrls.has(url) && !cachedUrls.has(url));
 }
 
+export async function enqueueSeedUrls(
+  seedFileName: string,
+  failedUrls: Set<string>,
+  cachedUrls: Set<string>,
+  requestQueue: RequestQueue,
+  batchSize: number = DEFAULT_SEED_ENQUEUE_BATCH_SIZE,
+): Promise<{ scannedCount: number; enqueuedCount: number }> {
+  const filePath = path.join(process.cwd(), seedFileName);
+
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`Seed file not found: ${filePath}`);
+  }
+
+  let scannedCount = 0;
+  let enqueuedCount = 0;
+  const requestBatch: Array<{ url: string; uniqueKey: string }> = [];
+
+  const flushBatch = async (): Promise<void> => {
+    if (requestBatch.length === 0) return;
+
+    const { processedRequests } = await requestQueue.addRequests(requestBatch);
+    enqueuedCount += processedRequests.filter(
+      (req) => !req.wasAlreadyHandled && !req.wasAlreadyPresent,
+    ).length;
+    requestBatch.length = 0;
+  };
+
+  const lineReader = createInterface({
+    input: fs.createReadStream(filePath, { encoding: "utf8" }),
+    crlfDelay: Infinity,
+  });
+
+  for await (const line of lineReader) {
+    scannedCount += 1;
+    const normalized = validateAndNormalizeUrl(line);
+
+    if (!normalized || failedUrls.has(normalized) || cachedUrls.has(normalized)) {
+      continue;
+    }
+
+    requestBatch.push({ url: normalized, uniqueKey: normalized });
+
+    if (requestBatch.length >= batchSize) {
+      await flushBatch();
+    }
+  }
+
+  await flushBatch();
+
+  return { scannedCount, enqueuedCount };
+}
+
 export async function addToFailedUrls(
   failedUrls: Set<string>,
   url: string,
@@ -238,19 +304,30 @@ export async function addToCache(
   reason: string,
 ): Promise<void> {
   const urlArray = Array.isArray(urls) ? urls : [urls];
-  const newUrls = urlArray.filter((url) => {
-    const normalized = validateAndNormalizeUrl(url.trim());
-    return normalized && !cachedUrls.has(normalized);
-  });
+  const seenInBatch = new Set<string>();
+  const normalizedUrlsToAdd: string[] = [];
 
-  if (newUrls.length > 0) {
-    await appendFile("cache.txt", newUrls.join("\n") + "\n");
-    newUrls.forEach((url) => {
-      const normalized = validateAndNormalizeUrl(url.trim());
-      if (normalized) cachedUrls.add(normalized);
-    });
-    utilsLogger.info({ reason, addedCount: newUrls.length }, "Added URLs to cache.txt");
+  for (const rawUrl of urlArray) {
+    const normalized = validateAndNormalizeUrl(rawUrl.trim());
+    if (!normalized) continue;
+    if (cachedUrls.has(normalized) || seenInBatch.has(normalized)) continue;
+
+    seenInBatch.add(normalized);
+    normalizedUrlsToAdd.push(normalized);
   }
+
+  if (normalizedUrlsToAdd.length === 0) return;
+
+  await appendFile("cached_urls.txt", normalizedUrlsToAdd.join("\n") + "\n");
+
+  for (const normalizedUrl of normalizedUrlsToAdd) {
+    cachedUrls.add(normalizedUrl);
+  }
+
+  utilsLogger.info(
+    { reason, addedCount: normalizedUrlsToAdd.length },
+    "Added URLs to cache_urls.txt",
+  );
 }
 
 export async function cleanupStorage(): Promise<void> {
@@ -270,45 +347,41 @@ export async function uploadBatch(
 ): Promise<void> {
   if (items.length === 0) return;
 
-  try {
-    const uniqueItems = Array.from(new Map(items.map((item) => [item.url, item])).values());
+  const uniqueItems = Array.from(new Map(items.map((item) => [item.url, item])).values());
 
-    const rows = uniqueItems.map((item) => ({
-      url: item.url,
-      hostname: item.hostname ?? "",
-      domain: item.domain ?? "",
-      title: item.title,
-      favicon: item.favicon,
-      images: item.images,
-    }));
+  const rows = uniqueItems.map((item) => ({
+    url: item.url,
+    hostname: item.hostname ?? "",
+    domain: item.domain ?? "",
+    title: item.title,
+    favicon: item.favicon,
+    images: item.images,
+  }));
 
-    await db
-      .insert(scrapedImages)
-      .values(rows)
-      .onConflictDoUpdate({
-        target: scrapedImages.url,
-        set: {
-          hostname: sql`excluded.hostname`,
-          domain: sql`excluded.domain`,
-          title: sql`excluded.title`,
-          favicon: sql`excluded.favicon`,
-          images: sql`excluded.images`,
-          updatedAt: sql`now()`,
-        },
-      });
+  await db
+    .insert(scrapedImages)
+    .values(rows)
+    .onConflictDoUpdate({
+      target: scrapedImages.url,
+      set: {
+        hostname: sql`excluded.hostname`,
+        domain: sql`excluded.domain`,
+        title: sql`excluded.title`,
+        favicon: sql`excluded.favicon`,
+        images: sql`excluded.images`,
+        updatedAt: sql`now()`,
+      },
+    });
 
-    await Dataset.pushData(uniqueItems);
+  await Dataset.pushData(uniqueItems);
 
-    const urlsToCache = uniqueItems
-      .map((item) => validateAndNormalizeUrl(item.url))
-      .filter((url): url is string => url !== null);
+  const urlsToCache = uniqueItems
+    .map((item) => validateAndNormalizeUrl(item.url))
+    .filter((url): url is string => url !== null);
 
-    await addToCacheFn(urlsToCache, "Successful database upload");
+  await addToCacheFn(urlsToCache, "Successful database upload");
 
-    utilsLogger.info({ uploadedCount: uniqueItems.length }, "Uploaded items to database");
-  } catch (error) {
-    utilsLogger.error({ err: toError(error) }, "Failed to upload batch");
-  }
+  utilsLogger.info({ uploadedCount: uniqueItems.length }, "Uploaded scraped images to database");
 }
 
 export function dispatchBatch(
@@ -318,7 +391,13 @@ export function dispatchBatch(
 ): void {
   if (items.length === 0) return;
 
-  const upload = uploadBatchFn(items);
+  const upload = uploadBatchFn(items).catch((error) => {
+    context.itemBatch.unshift(...items);
+    utilsLogger.error(
+      { err: toError(error), itemCount: items.length },
+      "Batch upload failed; re-queued for retry",
+    );
+  });
   context.pendingUploads.push(upload);
   upload.finally(() => {
     const idx = context.pendingUploads.indexOf(upload);
@@ -340,31 +419,63 @@ export async function flushPendingUploads(
   context: BatchContext,
   uploadBatchFn: (items: RawItem[]) => Promise<void>,
 ): Promise<void> {
-  if (context.itemBatch.length > 0) {
-    utilsLogger.info({ remainingCount: context.itemBatch.length }, "Flushing remaining items");
-    dispatchBatch(context, context.itemBatch.splice(0, context.itemBatch.length), uploadBatchFn);
+  for (let pass = 1; pass <= MAX_FLUSH_PASSES; pass += 1) {
+    if (context.itemBatch.length > 0) {
+      utilsLogger.info(
+        { pass, remainingCount: context.itemBatch.length },
+        "Flushing remaining items",
+      );
+      dispatchBatch(context, context.itemBatch.splice(0, context.itemBatch.length), uploadBatchFn);
+    }
+
+    if (context.pendingUploads.length > 0) {
+      utilsLogger.info(
+        { pass, inFlightCount: context.pendingUploads.length },
+        "Waiting for in-flight uploads",
+      );
+
+      const pendingSnapshot = [...context.pendingUploads];
+
+      const timeout = new Promise<"timeout">((resolve) =>
+        setTimeout(() => resolve("timeout"), FLUSH_TIMEOUT_MS),
+      );
+
+      const result = await Promise.race([
+        Promise.allSettled(pendingSnapshot).then(() => "done" as const),
+        timeout,
+      ]);
+
+      if (result === "timeout") {
+        utilsLogger.error(
+          { pass, pendingCount: context.pendingUploads.length },
+          "Flush timed out; uploads may be incomplete",
+        );
+        break;
+      }
+    }
+
+    if (context.itemBatch.length === 0 && context.pendingUploads.length === 0) {
+      utilsLogger.info("All uploads completed successfully");
+      return;
+    }
+
+    utilsLogger.warn(
+      {
+        pass,
+        remainingCount: context.itemBatch.length,
+        inFlightCount: context.pendingUploads.length,
+      },
+      "Uploads still pending after flush pass; retrying",
+    );
   }
 
-  if (context.pendingUploads.length === 0) return;
-
-  utilsLogger.info(
-    { inFlightCount: context.pendingUploads.length },
-    "Waiting for in-flight uploads",
-  );
-
-  const timeout = new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 30_000));
-
-  const result = await Promise.race([
-    Promise.allSettled(context.pendingUploads).then(() => "done" as const),
-    timeout,
-  ]);
-
-  if (result === "timeout") {
+  if (context.itemBatch.length > 0 || context.pendingUploads.length > 0) {
     utilsLogger.error(
-      { pendingCount: context.pendingUploads.length },
-      "Flush timed out; uploads may be incomplete",
+      {
+        remainingCount: context.itemBatch.length,
+        inFlightCount: context.pendingUploads.length,
+      },
+      "Flush finished with pending uploads",
     );
-  } else {
-    utilsLogger.info("All uploads completed successfully");
   }
 }

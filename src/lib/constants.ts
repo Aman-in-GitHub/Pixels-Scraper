@@ -40,7 +40,10 @@ export const PAGE_TYPES_TO_EXCLUDE = [
 export const TRUSTED_WEBSITES_TO_EXCLUDE = [
   // Video & Streaming Platforms
   "youtube.com",
+  "youtu.be",
+  "youtube-nocookie.com",
   "vimeo.com",
+  "twitch.com",
   "twitch.tv",
   "netflix.com",
   "hulu.com",
@@ -55,10 +58,19 @@ export const TRUSTED_WEBSITES_TO_EXCLUDE = [
 
   // Social Media Platforms (Mainstream)
   "facebook.com",
+  "fb.com",
+  "facebook.net",
+  "messenger.com",
+  "meta.com",
+  "threads.net",
   "instagram.com",
+  "instagr.am",
   "twitter.com",
   "x.com",
+  "t.co",
+  "twimg.com",
   "linkedin.com",
+  "lnkd.in",
   "tiktok.com",
   "snapchat.com",
   "pinterest.com",
@@ -67,16 +79,21 @@ export const TRUSTED_WEBSITES_TO_EXCLUDE = [
   "discord.com",
   "telegram.org",
   "whatsapp.com",
+  "wechat.com",
+  "weibo.com",
 
   // Professional Stock Photo/Media Sites
   "shutterstock.com",
   "gettyimages.com",
   "istockphoto.com",
+  "istock.com",
   "adobe.com",
   "unsplash.com",
   "pexels.com",
   "pixabay.com",
   "freepik.com",
+  "vectorstock.com",
+  "canstockphoto.com",
   "depositphotos.com",
   "alamy.com",
   "123rf.com",
@@ -177,6 +194,9 @@ export const TRUSTED_WEBSITES_TO_EXCLUDE = [
 
   // Cloud & Enterprise Services
   "google.com",
+  "googleapis.com",
+  "gstatic.com",
+  "googleusercontent.com",
   "microsoft.com",
   "apple.com",
   "ibm.com",
@@ -195,12 +215,15 @@ export const TRUSTED_WEBSITES_TO_EXCLUDE = [
   "trello.com",
   "asana.com",
   "monday.com",
+  "miro.com",
+  "cloudflare.com",
+  "fastly.com",
 
   // Search Engines & Maps
-  "google.com",
   "bing.com",
   "yahoo.com",
   "duckduckgo.com",
+  "startpage.com",
   "yandex.com",
   "baidu.com",
   "maps.google.com",
@@ -226,6 +249,7 @@ export const TRUSTED_WEBSITES_TO_EXCLUDE = [
   "tripadvisor.com",
   "kayak.com",
   "priceline.com",
+  "trivago.com",
   "uber.com",
   "lyft.com",
   "delta.com",
@@ -237,13 +261,11 @@ export const TRUSTED_WEBSITES_TO_EXCLUDE = [
   "mayoclinic.org",
   "healthline.com",
   "medscape.com",
-  "nih.gov",
-  "cdc.gov",
-  "who.int",
   "pubmed.ncbi.nlm.nih.gov",
 
   // Gaming Platforms
   "steam.com",
+  "steampowered.com",
   "epicgames.com",
   "origin.com",
   "uplay.com",
@@ -257,6 +279,7 @@ export const TRUSTED_WEBSITES_TO_EXCLUDE = [
   "spotify.com",
   "apple.com/music",
   "youtube.com/music",
+  "music.youtube.com",
   "soundcloud.com",
   "pandora.com",
   "tidal.com",
@@ -276,15 +299,6 @@ export const TRUSTED_WEBSITES_TO_EXCLUDE = [
   "adobe.com/products/photoshop",
   "adobe.com/products/illustrator",
 
-  // Wikis & Reference
-  "wikipedia.org",
-  "wikimedia.org",
-  "wiktionary.org",
-  "archive.org",
-  "dictionary.com",
-  "merriam-webster.com",
-  "britannica.com",
-
   // Food & Recipes
   "allrecipes.com",
   "foodnetwork.com",
@@ -303,6 +317,7 @@ export const TRUSTED_WEBSITES_TO_EXCLUDE = [
 
   // Sports & Entertainment
   "espn.com",
+  "espncricinfo.com",
   "nfl.com",
   "nba.com",
   "mlb.com",
@@ -323,12 +338,4 @@ export const TRUSTED_WEBSITES_TO_EXCLUDE = [
   "smugmug.com",
 ];
 
-export const EXCLUDE_PATTERNS = [
-  new RegExp(`\\.(${PAGE_TYPES_TO_EXCLUDE.join("|")})$`, "i"),
-  new RegExp(`(${TRUSTED_WEBSITES_TO_EXCLUDE.join("|").replace(/\./g, "\\.")})`, "i"),
-  /^javascript:/i,
-  /^mailto:/i,
-  /^tel:/i,
-  /^#/,
-  /^void\(0\)/i,
-];
+export const EXCLUDE_PATTERNS = [/^javascript:/i, /^mailto:/i, /^tel:/i, /^#/, /^void\(0\)/i];
