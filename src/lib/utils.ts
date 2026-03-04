@@ -1,7 +1,7 @@
 import type { CheerioAPI } from "crawlee";
 import type { Page } from "playwright";
 
-import { Dataset, log } from "crawlee";
+import { Dataset } from "crawlee";
 import crypto from "crypto";
 import { sql } from "drizzle-orm";
 import fs from "fs";
@@ -11,6 +11,13 @@ import path from "path";
 
 import { db } from "@/db";
 import { scrapedImages } from "@/db/schema";
+import { logger } from "@/lib/logger";
+
+const utilsLogger = logger.child({ module: "utils" });
+
+function toError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
 
 export type RawItem = {
   url: string;
@@ -30,10 +37,6 @@ export type BatchContext = {
   itemBatch: RawItem[];
   pendingUploads: Promise<void>[];
 };
-
-export function isDevMode() {
-  return process.env.NODE_ENV === "development";
-}
 
 export function generateRandomString() {
   return crypto.randomBytes(16).toString("hex");
@@ -107,7 +110,7 @@ export function validateAndNormalizeUrl(url: string): string | null {
 
     return normalized;
   } catch (error) {
-    log.warning(`Invalid URL skipped: ${url} - ${error}`);
+    utilsLogger.warn({ url, err: toError(error) }, "Invalid URL skipped");
     return null;
   }
 }
@@ -225,7 +228,7 @@ export async function addToFailedUrls(
   if (normalizedUrl && !failedUrls.has(normalizedUrl)) {
     failedUrls.add(normalizedUrl);
     await appendFile("failed_urls.txt", normalizedUrl + "\n");
-    log.info(`${reason} | ${url} added to failed_urls.txt`);
+    utilsLogger.info({ reason, url }, "Added URL to failed_urls.txt");
   }
 }
 
@@ -246,7 +249,7 @@ export async function addToCache(
       const normalized = validateAndNormalizeUrl(url.trim());
       if (normalized) cachedUrls.add(normalized);
     });
-    log.info(`${reason} | Added ${newUrls.length} new URLs to cache.txt`);
+    utilsLogger.info({ reason, addedCount: newUrls.length }, "Added URLs to cache.txt");
   }
 }
 
@@ -257,7 +260,7 @@ export async function cleanupStorage(): Promise<void> {
       fs.rmSync(storagePath, { recursive: true, force: true });
     }
   } catch (error) {
-    log.warning(`Failed to cleanup storage: ${error}`);
+    utilsLogger.warn({ err: toError(error) }, "Failed to clean up storage");
   }
 }
 
@@ -302,9 +305,9 @@ export async function uploadBatch(
 
     await addToCacheFn(urlsToCache, "Successful database upload");
 
-    log.info(`SUCCESS: Uploaded ${uniqueItems.length} items to database`);
+    utilsLogger.info({ uploadedCount: uniqueItems.length }, "Uploaded items to database");
   } catch (error) {
-    log.error(`Failed to upload batch: ${error}`);
+    utilsLogger.error({ err: toError(error) }, "Failed to upload batch");
   }
 }
 
@@ -338,13 +341,16 @@ export async function flushPendingUploads(
   uploadBatchFn: (items: RawItem[]) => Promise<void>,
 ): Promise<void> {
   if (context.itemBatch.length > 0) {
-    log.info(`Flushing remaining ${context.itemBatch.length} items...`);
+    utilsLogger.info({ remainingCount: context.itemBatch.length }, "Flushing remaining items");
     dispatchBatch(context, context.itemBatch.splice(0, context.itemBatch.length), uploadBatchFn);
   }
 
   if (context.pendingUploads.length === 0) return;
 
-  log.info(`Waiting for ${context.pendingUploads.length} in-flight uploads...`);
+  utilsLogger.info(
+    { inFlightCount: context.pendingUploads.length },
+    "Waiting for in-flight uploads",
+  );
 
   const timeout = new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 30_000));
 
@@ -354,8 +360,11 @@ export async function flushPendingUploads(
   ]);
 
   if (result === "timeout") {
-    log.error(`Flush timed out — ${context.pendingUploads.length} uploads may be incomplete`);
+    utilsLogger.error(
+      { pendingCount: context.pendingUploads.length },
+      "Flush timed out; uploads may be incomplete",
+    );
   } else {
-    log.info("All uploads completed successfully");
+    utilsLogger.info("All uploads completed successfully");
   }
 }

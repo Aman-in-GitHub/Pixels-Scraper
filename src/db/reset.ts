@@ -1,10 +1,13 @@
 import { sql } from "drizzle-orm";
 
 import { db } from "@/db";
+import { logger } from "@/lib/logger";
 
 const FORCE_FLAG = "--force";
 
 const RESET_SENTINEL = "yes do it";
+
+const resetLogger = logger.child({ module: "db-reset" });
 
 function isForceMode() {
   return process.argv.includes(FORCE_FLAG);
@@ -15,7 +18,7 @@ async function confirmReset() {
     return true;
   }
 
-  console.log("This will DELETE all data in the public schema.");
+  resetLogger.warn("This will DELETE all data in the public schema.");
 
   const answer = prompt(`Type "${RESET_SENTINEL}" to continue: `);
 
@@ -40,25 +43,24 @@ async function reset() {
   const confirmed = await confirmReset();
 
   if (!confirmed) {
-    console.log("Reset cancelled.");
+    resetLogger.info("Reset cancelled");
     process.exit(0);
   }
 
-  console.log("Starting database reset...");
+  resetLogger.info("Starting database reset");
 
-  console.log("Dropping and recreating public schema...");
+  resetLogger.info("Dropping and recreating public schema");
 
   await resetSchema();
 
-  console.log("Running migrations...");
+  resetLogger.info("Running migrations");
 
   await runMigrations();
 
-  console.log("Database reset complete.");
+  resetLogger.info("Database reset complete");
 }
 
 reset().catch((err) => {
-  console.error("Database reset failed.");
-  console.error(err);
+  resetLogger.error({ err }, "Database reset failed");
   process.exit(1);
 });

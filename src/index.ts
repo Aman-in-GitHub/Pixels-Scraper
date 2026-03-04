@@ -1,7 +1,16 @@
-import { CheerioCrawler, Dataset, log, PlaywrightCrawler, RequestQueue } from "crawlee";
+import {
+  CheerioCrawler,
+  Dataset,
+  LogLevel,
+  PlaywrightCrawler,
+  Request,
+  RequestQueue,
+  log as crawleeLog,
+} from "crawlee";
 import { parse } from "tldts";
 
 import { BATCH_SIZE, EXCLUDE_PATTERNS } from "@/lib/constants.js";
+import { logger } from "@/lib/logger.js";
 import {
   addToCache,
   addToFailedUrls,
@@ -19,20 +28,92 @@ import {
   uploadBatch,
   validateAndNormalizeUrl,
 } from "@/lib/utils.js";
+
+const crawlerLogger = logger.child({ module: "crawler" });
+
+const PLAYWRIGHT_FALLBACK_FLAG = "__playwrightFallbackQueued";
+
+crawleeLog.setLevel(LogLevel.OFF);
+
 const batchContext: BatchContext = { itemBatch: [], pendingUploads: [] };
-const failedUrls = loadNormalizedUrlSet("failed_urls.txt");
+
 const cachedUrls = loadNormalizedUrlSet("cache.txt");
+
+const failedUrls = loadNormalizedUrlSet("failed_urls.txt");
+
 const seedUrls = loadSeedUrls("seed.txt", failedUrls, cachedUrls);
 
 const uploadBatchHandler = (items: RawItem[]) =>
   uploadBatch(items, (urls, reason) => addToCache(cachedUrls, urls, reason));
 
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error ?? "");
+}
+
+function getErrorCode(error: unknown): string {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    return String((error as { code: unknown }).code ?? "");
+  }
+
+  return "";
+}
+
+function isTlsNavigationError(error: unknown): boolean {
+  const message = getErrorMessage(error).toLowerCase();
+  const code = getErrorCode(error).toUpperCase();
+
+  if (
+    message.includes("cannot destructure property 'subject'") ||
+    message.includes("checkserveridentity")
+  ) {
+    return true;
+  }
+
+  if (code.startsWith("ERR_TLS_") || code.startsWith("CERT_")) {
+    return true;
+  }
+
+  return (
+    code === "DEPTH_ZERO_SELF_SIGNED_CERT" ||
+    code === "SELF_SIGNED_CERT_IN_CHAIN" ||
+    code === "UNABLE_TO_VERIFY_LEAF_SIGNATURE"
+  );
+}
+
+async function queuePlaywrightFallbackForTlsError(
+  request: Request,
+  error: unknown,
+  playwrightQueue: RequestQueue,
+): Promise<boolean> {
+  if (!isTlsNavigationError(error)) return false;
+
+  const alreadyQueued = Boolean(request.userData[PLAYWRIGHT_FALLBACK_FLAG]);
+
+  if (alreadyQueued) return true;
+
+  request.userData[PLAYWRIGHT_FALLBACK_FLAG] = true;
+
+  request.noRetry = true;
+
+  crawlerLogger.warn({ url: request.url }, "Cheerio TLS failure, retrying with Playwright");
+
+  await playwrightQueue.addRequest({
+    url: request.url,
+    uniqueKey: `playwright-fallback-${request.uniqueKey}`,
+  });
+
+  return true;
+}
+
 async function startCrawler(): Promise<void> {
   await cleanupStorage();
 
-  log.info(`Loaded ${cachedUrls.size} cached URLs and ${failedUrls.size} failed URLs`);
+  crawlerLogger.info(
+    { cachedCount: cachedUrls.size, failedCount: failedUrls.size },
+    "Loaded URL caches",
+  );
 
-  log.info(`Starting with ${seedUrls.length} seed URLs after filtering`);
+  crawlerLogger.info({ seedCount: seedUrls.length }, "Starting crawl with filtered seed URLs");
 
   const cheerioQueue = await RequestQueue.open(`CHEERIO-QUEUE-${Date.now()}`);
 
@@ -50,25 +131,22 @@ async function startCrawler(): Promise<void> {
         gotOptions.https = {
           ...gotOptions.https,
           rejectUnauthorized: false,
-          checkServerIdentity: () => undefined,
+          checkServerIdentity: (_hostname, _cert) => undefined,
         };
       },
     ],
 
-    failedRequestHandler: async ({ request, error }) => {
-      const errorMessage = error instanceof Error ? error.message : String(error ?? "");
-      const isTlsIdentityFailure =
-        errorMessage.includes("Cannot destructure property 'subject'") ||
-        errorMessage.includes("checkServerIdentity");
+    errorHandler: async ({ request }, error) => {
+      await queuePlaywrightFallbackForTlsError(request, error, playwrightQueue);
+    },
 
-      if (isTlsIdentityFailure) {
-        log.warning(`Cheerio TLS failure, retrying with Playwright: ${request.url}`);
-        await playwrightQueue.addRequest({
-          url: request.url,
-          uniqueKey: `playwright-fallback-${request.uniqueKey}`,
-        });
-        return;
-      }
+    failedRequestHandler: async ({ request }, error) => {
+      const queuedForPlaywright = await queuePlaywrightFallbackForTlsError(
+        request,
+        error,
+        playwrightQueue,
+      );
+      if (queuedForPlaywright) return;
 
       await addToFailedUrls(failedUrls, request.url, "Cheerio: too many retries");
     },
@@ -77,12 +155,12 @@ async function startCrawler(): Promise<void> {
       const normalizedLoadedUrl = validateAndNormalizeUrl(request.loadedUrl);
 
       if (normalizedLoadedUrl && cachedUrls.has(normalizedLoadedUrl)) {
-        log.info(`SKIPPING (cached): ${request.loadedUrl}`);
+        crawlerLogger.debug({ url: request.loadedUrl }, "Skipping cached URL");
         return;
       }
 
       if (needsJsRendering($)) {
-        log.info(`ESCALATING to Playwright: ${request.loadedUrl}`);
+        crawlerLogger.debug({ url: request.loadedUrl }, "Escalating URL to Playwright");
         await playwrightQueue.addRequest({ url: request.loadedUrl });
         return;
       }
@@ -133,8 +211,17 @@ async function startCrawler(): Promise<void> {
         images: imageUrls,
       });
 
-      log.info(
-        `[CHEERIO] ${title} | ${parsedUrl.hostname} | ${imageUrls.length} image(s) | Batch: ${batchContext.itemBatch.length}/${BATCH_SIZE}`,
+      crawlerLogger.info(
+        {
+          crawler: "cheerio",
+          title,
+          hostname: parsedUrl.hostname,
+          imageCount: imageUrls.length,
+          batchSize: batchContext.itemBatch.length,
+          batchLimit: BATCH_SIZE,
+          url: request.loadedUrl,
+        },
+        "Page processed",
       );
 
       processBatch(batchContext, BATCH_SIZE, uploadBatchHandler);
@@ -157,7 +244,7 @@ async function startCrawler(): Promise<void> {
       const normalizedLoadedUrl = validateAndNormalizeUrl(request.loadedUrl);
 
       if (normalizedLoadedUrl && cachedUrls.has(normalizedLoadedUrl)) {
-        log.info(`SKIPPING (cached): ${request.loadedUrl}`);
+        crawlerLogger.debug({ url: request.loadedUrl }, "Skipping cached URL");
         return;
       }
 
@@ -216,8 +303,17 @@ async function startCrawler(): Promise<void> {
         images: imageUrls,
       });
 
-      log.info(
-        `[PLAYWRIGHT] ${title} | ${parsedUrl.hostname} | ${imageUrls.length} image(s) | Batch: ${batchContext.itemBatch.length}/${BATCH_SIZE}`,
+      crawlerLogger.info(
+        {
+          crawler: "playwright",
+          title,
+          hostname: parsedUrl.hostname,
+          imageCount: imageUrls.length,
+          batchSize: batchContext.itemBatch.length,
+          batchLimit: BATCH_SIZE,
+          url: request.loadedUrl,
+        },
+        "Page processed",
       );
 
       processBatch(batchContext, BATCH_SIZE, uploadBatchHandler);
@@ -232,7 +328,7 @@ async function startCrawler(): Promise<void> {
 
   await cleanupStorage();
 
-  log.info("SUCCESS: Scraping completed successfully");
+  crawlerLogger.info("Scraping completed successfully");
 }
 
 startCrawler();

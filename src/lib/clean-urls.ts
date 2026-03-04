@@ -1,15 +1,19 @@
 import fs from "node:fs";
 
+import { logger } from "@/lib/logger";
+
 const seedFile = "seed.txt";
 const failedFile = "failed_urls.txt";
 
+const cleanUrlsLogger = logger.child({ module: "clean-urls" });
+
 if (!fs.existsSync(seedFile)) {
-  console.log(`Error: ${seedFile} not found`);
+  cleanUrlsLogger.error({ file: seedFile }, "Required seed file not found");
   process.exit(1);
 }
 
 if (!fs.existsSync(failedFile)) {
-  console.log(`No ${failedFile} found - nothing to clean`);
+  cleanUrlsLogger.info({ file: failedFile }, "Nothing to clean: failed URL file missing");
   process.exit(0);
 }
 
@@ -22,7 +26,7 @@ const failedUrls = new Set(
 );
 
 if (failedUrls.size === 0) {
-  console.log(`${failedFile} is empty - nothing to clean`);
+  cleanUrlsLogger.info({ file: failedFile }, "Nothing to clean: failed URL file is empty");
   fs.unlinkSync(failedFile);
   process.exit(0);
 }
@@ -40,7 +44,12 @@ const cleanUrls = originalUrls
 fs.writeFileSync(seedFile, cleanUrls.join(""));
 fs.unlinkSync(failedFile);
 
-console.log(`Cleaned ${seedFile}`);
-console.log(`Kept ${cleanUrls.length} URLs`);
-console.log(`Removed ${originalUrls.length - cleanUrls.length} URLs`);
-console.log(`Deleted ${failedFile}`);
+cleanUrlsLogger.info(
+  {
+    seedFile,
+    failedFile,
+    keptCount: cleanUrls.length,
+    removedCount: originalUrls.length - cleanUrls.length,
+  },
+  "Cleaned seed file and removed failed URL file",
+);
